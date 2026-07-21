@@ -1,0 +1,1550 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<!-- These three are what actually let the page draw behind the status bar
+     (clock/battery) when launched full-screen. viewport-fit=cover alone
+     only reserves the safe-area-inset-* variables — without declaring the
+     page as a standalone, translucent-status-bar app, iOS/Android instead
+     push the whole layout down below the status bar and safe-area-inset-top
+     stays 0. -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#e8e6df" />
+<title>BeerMap</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<style>
+  :root{
+    --amber:#FFB020;
+    --amber-deep:#E8940A;
+    --red:#FF3B30;
+    --ink:#1C1C1E;
+    --ink-soft:#3A3A3C;
+    --muted:#8E8E93;
+
+    /* Liquid Glass material tokens — clear glass: minimal white tint, saturation ~150% so color from beneath reads through vividly */
+    --lg-tint:rgba(255,255,255,0.05);
+    --lg-tint-strong:rgba(255,255,255,0.09);
+    --lg-blur:8px;
+    --lg-sat:165%;
+    --lg-bright:106%;
+    --lg-rim-top:rgba(255,255,255,0.95);
+    --lg-rim-bottom:rgba(255,255,255,0.35);
+    --lg-shadow:0 1px 2px rgba(0,0,0,0.06), 0 10px 28px rgba(0,0,0,0.16), 0 22px 50px rgba(0,0,0,0.10);
+    --lg-shadow-pressed:0 1px 1px rgba(0,0,0,0.08), 0 3px 8px rgba(0,0,0,0.14);
+    --safe-top:env(safe-area-inset-top,0px);
+    --safe-bottom:env(safe-area-inset-bottom,0px);
+  }
+
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{
+    margin:0; padding:0; height:100%; width:100%;
+    overflow:hidden; overscroll-behavior:none;
+    font-family:-apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+    background:#e8e6df;
+    color:var(--ink);
+  }
+
+  #app{ position:relative; height:100vh; height:100dvh; width:100vw; overflow:hidden; }
+
+  #lg-defs{ position:absolute; width:0; height:0; overflow:hidden; }
+
+  /* ---------- MAP ---------- */
+  #map{ position:absolute; inset:0; z-index:1; background:#e8e6df; }
+  .leaflet-control-attribution{
+    font-size:9px !important;
+    background:rgba(255,255,255,0.5) !important;
+    backdrop-filter:blur(6px);
+    border-radius:8px 0 0 0;
+  }
+  .leaflet-control-zoom{ display:none; } /* mobile: no zoom buttons, pinch/double-tap only */
+
+  /* ---------- LIQUID GLASS MATERIAL ---------- */
+  /* Anatomy: (1) an SVG lensing filter bends the content behind it at the edges,
+     (2) tint + blur + saturation sits above that, (3) a rim border bright at the
+     top and dim at the bottom simulates one overhead light source, (4) a specular
+     highlight repositions on pointer/tilt input rather than looping endlessly —
+     real Liquid Glass reacts to device motion, it doesn't animate on a timer. */
+  .lg{
+    position:relative;
+    isolation:isolate;
+    overflow:hidden;
+    /* Forces Safari onto its own compositing layer for this element.
+       Without this, WebKit's backdrop-filter ignores border-radius and
+       paints as a square instead of clipping to the rounded shape
+       (WebKit bug 158807). transform:translateZ(0) is the standard fix. */
+    -webkit-transform:translateZ(0);
+    transform:translateZ(0);
+    background:var(--lg-tint);
+    -webkit-backdrop-filter:blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(var(--lg-bright));
+    backdrop-filter:blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(var(--lg-bright));
+    box-shadow:
+      inset 0 0.5px 0.5px var(--lg-rim-top),
+      inset 0 -0.5px 0.5px var(--lg-rim-bottom),
+      inset 0.5px 0 0.5px rgba(255,255,255,0.5),
+      inset -0.5px 0 0.5px rgba(255,255,255,0.2),
+      var(--lg-shadow);
+    transition:box-shadow .18s ease, transform .18s cubic-bezier(.4,0,.2,1);
+  }
+  /* Lensing ring: SVG-distorted refraction concentrated at the edge only,
+     layered as its own backdrop-filter so a browser that can't parse the
+     url() filter degrades to plain blur instead of dropping the whole stack. */
+  .lg::before{
+    content:"";
+    position:absolute; inset:0; z-index:1; pointer-events:none;
+    -webkit-backdrop-filter:url(#lg-lens);
+    backdrop-filter:url(#lg-lens);
+    -webkit-mask:linear-gradient(#000,#000) padding-box, linear-gradient(#000,#000);
+    -webkit-mask-composite:xor;
+    mask:linear-gradient(#000,#000) padding-box, linear-gradient(#000,#000);
+    mask-composite:exclude;
+    padding:7px;
+  }
+  .lg::after{
+    content:"";
+    position:absolute; inset:0; pointer-events:none; z-index:2;
+    background:radial-gradient(140px 90px at var(--specx,30%) var(--specy,0%), rgba(255,255,255,0.55), rgba(255,255,255,0) 70%);
+    opacity:.9;
+    mix-blend-mode:screen;
+  }
+  .lg:active{
+    box-shadow:
+      inset 0 0.5px 0.5px var(--lg-rim-top),
+      inset 0 -0.5px 0.5px var(--lg-rim-bottom),
+      var(--lg-shadow-pressed);
+  }
+
+  .lg-clear{ background:var(--lg-tint-strong); }
+
+  /* ---------- HAMBURGER BUTTON ---------- */
+  #menuBtn{
+    position:absolute;
+    top:calc(var(--safe-top) + 14px);
+    left:16px;
+    z-index:55;
+    width:46px; height:46px;
+    border-radius:50%;
+    display:flex; align-items:center; justify-content:center;
+    border:none; padding:0;
+    -webkit-appearance:none; appearance:none;
+    cursor:pointer;
+    touch-action:none;
+    transition:transform .18s cubic-bezier(.4,0,.2,1);
+  }
+  #menuBtn:active{ transform:scale(0.90); }
+  #menuBtn svg{ width:20px; height:20px; position:relative; z-index:1; }
+  #menuBtn line{ stroke:var(--ink); stroke-width:2; stroke-linecap:round; }
+
+  /* ---------- SEARCH (top-right, the button itself morphs into the bar) ---------- */
+  /* One element does double duty: closed, it's a 46px circle (the search
+     button); open, it stretches leftward into a pill holding the input and
+     the filter/sort buttons. Because it's anchored by `right` and its right
+     edge never moves, the growth reads as the button itself expanding
+     outward rather than a second element sliding in beside it. */
+  #searchBar{
+    position:absolute;
+    top:calc(var(--safe-top) + 14px);
+    right:16px;
+    z-index:55;
+    width:46px; height:46px;
+    border-radius:23px;
+    display:flex; flex-direction:row-reverse; align-items:center;
+    gap:4px;
+    overflow:hidden;
+    transition:width .45s cubic-bezier(.32,.72,0,1), box-shadow .3s ease, transform .3s cubic-bezier(.34,1.4,.64,1);
+  }
+  #searchBar.open{
+    width:min(78vw, 300px);
+    box-shadow:
+      inset 0 0.5px 0.5px var(--lg-rim-top),
+      inset 0 -0.5px 0.5px var(--lg-rim-bottom),
+      var(--lg-shadow), 0 0 0 8px rgba(0,0,0,0.08);
+  }
+
+  #searchMain{
+    width:46px; height:46px; border-radius:50%;
+    flex-shrink:0;
+    border:none; padding:0; cursor:pointer;
+    display:flex; align-items:center; justify-content:center;
+    background:transparent;
+    -webkit-appearance:none; appearance:none;
+    position:relative; z-index:2;
+  }
+  #searchMain:active{ transform:scale(0.92); }
+  #searchMain svg{ width:20px; height:20px; position:relative; z-index:1; }
+
+  .search-mini{
+    width:34px; height:34px; border-radius:50%;
+    display:flex; align-items:center; justify-content:center;
+    flex-shrink:0; border:none; padding:0; cursor:pointer;
+    background:rgba(0,0,0,0.05);
+    opacity:0; transform:scale(0.7);
+    pointer-events:none;
+    transition:opacity .22s ease, transform .3s cubic-bezier(.34,1.4,.64,1);
+    -webkit-appearance:none; appearance:none;
+  }
+  #searchBar.open .search-mini{ opacity:1; transform:scale(1); pointer-events:auto; transition-delay:.12s; }
+  .search-mini svg{ width:17px; height:17px; }
+  .search-mini:active{ transform:scale(0.88); }
+
+  #searchInput{
+    flex:1 1 auto; min-width:0;
+    border:none; outline:none; background:transparent;
+    font-size:14.5px; color:var(--ink); font-family:inherit;
+    padding:0 2px 0 14px;
+    opacity:0;
+    transition:opacity .2s ease;
+  }
+  #searchBar.open #searchInput{ opacity:1; transition-delay:.16s; }
+  #searchInput::placeholder{ color:var(--muted); }
+
+  /* ---------- PAGE STACK (the map page as one solid layer that slides right) ---------- */
+  #pageStack{
+    position:absolute; inset:0;
+    z-index:10;
+    background:#e8e6df;
+    transform:translateX(0);
+    transform-origin:left center;
+    border-radius:0;
+    box-shadow:none;
+    transition:transform .42s cubic-bezier(.32,.72,0,1), border-radius .42s cubic-bezier(.32,.72,0,1), box-shadow .42s cubic-bezier(.32,.72,0,1);
+    overflow:hidden;
+  }
+  /* While the hamburger is being dragged, the transform is driven frame-by-frame
+     in JS to track the finger — the transition must be off during that, the same
+     way #pinSheet.dragging suspends its own CSS transition mid-gesture. */
+  #pageStack.dragging{ transition:none; }
+  /* Slides right only — size (width/height/scale) never changes, so the map
+     and every control inside the card keep their exact on-screen dimensions
+     whether the panel is open or closed. */
+  #pageStack.pushed{
+    transform:translateX(min(82%, 340px));
+    border-radius:26px;
+    box-shadow:-8px 0 40px rgba(0,0,0,0.28), -2px 0 12px rgba(0,0,0,0.18);
+  }
+
+  #pageScrim{
+    position:absolute; inset:0; z-index:50;
+    background:rgba(0,0,0,0.32);
+    opacity:0; pointer-events:none;
+    transition:opacity .3s ease;
+  }
+  #pageStack.pushed #pageScrim{ opacity:1; pointer-events:auto; }
+  /* While actively dragging, opacity is driven frame-by-frame in JS to
+     track the gesture — same reasoning as #pageStack.dragging above. */
+  #pageStack.dragging #pageScrim{ transition:none; }
+
+  /* ---------- SIDE PANEL (fixed bottom layer, revealed as the page stack slides off it) ---------- */
+  #sidePanel{
+    position:absolute; inset:0;
+    z-index:1;
+    width:82%;
+    max-width:340px;
+    background:#f4f3ef;
+    padding-top:calc(var(--safe-top) + 22px);
+    padding-bottom:calc(var(--safe-bottom) + 18px);
+    display:flex; flex-direction:column;
+  }
+
+  .panel-header{
+    padding:0 24px 20px;
+    display:flex; align-items:center; gap:14px;
+    border-bottom:0.5px solid rgba(0,0,0,0.08);
+    position:relative; z-index:1;
+  }
+  .panel-avatar{
+    width:40px; height:40px; border-radius:50%;
+    background:linear-gradient(145deg, var(--amber), var(--amber-deep));
+    display:flex; align-items:center; justify-content:center;
+    font-size:18px;
+    box-shadow:0 1px 2px rgba(0,0,0,0.08), 0 3px 8px rgba(232,148,10,0.22);
+    flex-shrink:0;
+  }
+  .panel-title{ font-size:17px; font-weight:600; letter-spacing:-0.3px; }
+  .panel-sub{ font-size:12.5px; color:var(--muted); margin-top:1px; }
+
+  .panel-nav{
+    flex:1; overflow-y:auto; padding:6px 12px 12px; position:relative; z-index:1;
+    -webkit-overflow-scrolling:touch;
+  }
+  .panel-section-label{
+    font-size:11.5px; font-weight:600; color:var(--muted);
+    text-transform:uppercase; letter-spacing:0.5px;
+    padding:20px 14px 8px;
+  }
+  .panel-item{
+    display:flex; align-items:center; gap:14px;
+    padding:11px 14px;
+    border-radius:16px;
+    font-size:15.5px; font-weight:500; color:var(--ink);
+    cursor:pointer;
+    -webkit-user-select:none; user-select:none;
+    transition:background .15s ease, transform .12s ease;
+  }
+  .panel-item:active{ background:rgba(0,0,0,0.06); transform:scale(0.985); }
+  .panel-item.active{ background:rgba(255,176,32,0.12); }
+  .panel-item.active .panel-icon{ background:var(--amber); }
+  .panel-item.active .panel-icon svg{ stroke:#fff; }
+  .panel-icon{
+    width:32px; height:32px; border-radius:10px;
+    background:rgba(120,120,128,0.14);
+    display:flex; align-items:center; justify-content:center;
+    flex-shrink:0;
+  }
+  .panel-icon svg{ width:17px; height:17px; stroke:var(--ink-soft); fill:none; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+  /* Trailing group: badge (optional) + chevron, flush right as one unit —
+     the chevron is the quiet "this row goes somewhere" affordance every
+     row gets; the badge is added only where there's a real count. */
+  .panel-trailing{ margin-left:auto; display:flex; align-items:center; gap:8px; flex-shrink:0; }
+  .panel-chevron{ width:14px; height:14px; stroke:var(--muted); fill:none; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; opacity:0.45; flex-shrink:0; }
+  .panel-badge{
+    background:var(--red); color:#fff; font-size:11px; font-weight:700;
+    min-width:19px; height:19px; border-radius:10px; display:flex; align-items:center; justify-content:center;
+    padding:0 5px;
+  }
+
+  .panel-footer{
+    padding:16px 24px 4px; position:relative; z-index:1;
+    border-top:0.5px solid rgba(0,0,0,0.08);
+    font-size:11.5px; color:var(--muted); text-align:center;
+  }
+
+  /* ---------- FAB ---------- */
+  /* --fab-main-d: the main circle's diameter, --fab-stack-gap: vertical
+     air between the two independent FAB stacks — both referenced from
+     #fabWrapCrawl's `bottom` so the second stack sits flush above the
+     first without any hand-tuned pixel guess baked in twice. */
+  :root{
+    --fab-main-d:60px;
+    --fab-stack-gap:16px;
+  }
+  #fabWrap{
+    position:absolute;
+    right:18px;
+    bottom:calc(var(--safe-bottom) + 22px);
+    z-index:25;
+    display:flex; flex-direction:column; align-items:flex-end;
+    gap:14px;
+    /* The wrapper's own box is taller than the visible "+" button (it also
+       spans the space its options occupy while closed/invisible). Without
+       this, that empty space sits in front of the pub-crawl FAB below it
+       (same z-index, later in DOM) and silently swallows its clicks. Only
+       the actual interactive children should receive pointer events. */
+    pointer-events:none;
+  }
+
+  .fab-option{
+    display:flex; align-items:center; gap:10px;
+    opacity:0; transform:translateY(14px) scale(0.85);
+    pointer-events:none;
+    transition:opacity .28s cubic-bezier(.34,1.1,.64,1), transform .38s cubic-bezier(.34,1.56,.64,1);
+  }
+  #fabWrap.open .fab-option, #fabWrapCrawl.open .fab-option{ opacity:1; transform:translateY(0) scale(1); pointer-events:auto; }
+  #fabWrap.open .fab-option:nth-child(1), #fabWrapCrawl.open .fab-option:nth-child(1){ transition-delay:.09s; }
+  #fabWrap.open .fab-option:nth-child(2), #fabWrapCrawl.open .fab-option:nth-child(2){ transition-delay:.02s; }
+
+  .fab-label{
+    font-size:13.5px; font-weight:600; color:var(--ink);
+    padding:9px 16px;
+    border-radius:20px;
+    white-space:nowrap;
+  }
+  .fab-mini{
+    width:48px; height:48px; border-radius:50%;
+    display:flex; align-items:center; justify-content:center;
+    flex-shrink:0; border:none; padding:0; cursor:pointer;
+    -webkit-appearance:none; appearance:none;
+  }
+  .fab-mini svg{ width:20px; height:20px; position:relative; z-index:3; }
+  .fab-mini:active{ transform:scale(0.9); }
+
+  #fabMain, #fabCrawlMain{
+    width:var(--fab-main-d); height:var(--fab-main-d); border-radius:50%;
+    border:none; padding:0; cursor:pointer;
+    display:flex; align-items:center; justify-content:center;
+    position:relative;
+    -webkit-appearance:none; appearance:none;
+    transition:transform .3s cubic-bezier(.34,1.4,.64,1), box-shadow .3s ease;
+  }
+  #fabMain:active, #fabCrawlMain:active{ transform:scale(0.92); }
+  #fabMain svg, #fabCrawlMain svg{ width:24px; height:24px; position:relative; z-index:3; transition:transform .38s cubic-bezier(.34,1.56,.64,1); }
+  #fabWrap.open #fabMain svg{ transform:rotate(135deg); }
+  #fabWrap.open #fabMain{ box-shadow:
+      inset 0 0.5px 0.5px var(--lg-rim-top),
+      inset 0 -0.5px 0.5px var(--lg-rim-bottom),
+      var(--lg-shadow), 0 0 0 8px rgba(0,0,0,0.08); }
+
+  /* ---------- FAB: Pub Crawl (second, independent stack above the first) ---------- */
+  /* .fab-option and its open/stagger rules above already apply generically
+     to any .fab-option regardless of parent, so this stack only needs its
+     own position and its own main-button icon/glow states. */
+  #fabWrapCrawl{
+    position:absolute;
+    right:18px;
+    bottom:calc(var(--safe-bottom) + 22px + var(--fab-main-d) + var(--fab-stack-gap));
+    z-index:25;
+    display:flex; flex-direction:column; align-items:flex-end;
+    gap:14px;
+    pointer-events:none;
+    opacity:1;
+    transform:translateY(0) scale(1);
+    transition:opacity .22s ease, transform .28s cubic-bezier(.34,1.1,.64,1);
+  }
+  /* While the "+" FAB is open, the pub-crawl FAB tucks itself away rather
+     than sitting there as a second, currently-irrelevant button. */
+  #fabWrapCrawl.hide{
+    opacity:0;
+    transform:translateY(14px) scale(0.85);
+  }
+  #fabWrapCrawl.hide #fabCrawlMain{ pointer-events:none; }
+
+  #fabMain, #fabCrawlMain{ pointer-events:auto; }
+
+  #fabCrawlMain svg{ width:22px; height:22px; }
+  #fabWrapCrawl.open #fabCrawlMain svg{ transform:rotate(135deg); }
+  #fabWrapCrawl.open #fabCrawlMain{ box-shadow:
+      inset 0 0.5px 0.5px var(--lg-rim-top),
+      inset 0 -0.5px 0.5px var(--lg-rim-bottom),
+      var(--lg-shadow), 0 0 0 8px rgba(0,0,0,0.08); }
+
+  /* ---------- PRICE FILTER (bottom slider) ---------- */
+  /* Minimal, iOS-control-style: one quiet line of text, a thin track with
+     a solid fill up to the current value, a plain round thumb — no boxed
+     scale, no gradients, no uppercase eyebrow label. */
+  #priceFilter{
+    position:absolute;
+    left:16px;
+    right:calc(18px + var(--fab-main-d) + 14px); /* clears the FAB stack */
+    bottom:calc(var(--safe-bottom) + 22px);
+    z-index:24;
+    border-radius:18px;
+    padding:12px 16px 10px;
+  }
+  .price-filter-row{
+    display:flex; align-items:baseline; justify-content:space-between;
+  }
+  .price-filter-label{
+    font-size:13px; font-weight:500; color:var(--ink-soft);
+  }
+  .price-filter-value{
+    font-size:13px; font-weight:600; color:var(--ink);
+  }
+  #priceFilterSlider{
+    -webkit-appearance:none; appearance:none;
+    width:100%; height:4px; border-radius:2px;
+    background:rgba(0,0,0,0.1);
+    margin:14px 0 2px;
+    display:block;
+    touch-action:pan-x;
+  }
+  #priceFilterSlider::-webkit-slider-runnable-track{
+    height:4px; border-radius:2px; background:transparent;
+  }
+  #priceFilterSlider::-moz-range-track{
+    height:4px; border-radius:2px; background:transparent;
+  }
+  #priceFilterSlider::-webkit-slider-thumb{
+    -webkit-appearance:none; appearance:none;
+    width:20px; height:20px; border-radius:50%;
+    background:#fff;
+    box-shadow:0 1px 3px rgba(0,0,0,0.28), 0 0 0 0.5px rgba(0,0,0,0.05);
+    margin-top:-8px;
+    cursor:pointer;
+    transition:transform .15s cubic-bezier(.34,1.56,.64,1), box-shadow .15s ease;
+  }
+  #priceFilterSlider:active::-webkit-slider-thumb{
+    transform:scale(1.22);
+    box-shadow:0 2px 8px rgba(0,0,0,0.32), 0 0 0 0.5px rgba(0,0,0,0.06);
+  }
+  #priceFilterSlider::-moz-range-thumb{
+    width:20px; height:20px; border-radius:50%;
+    background:#fff; border:none;
+    box-shadow:0 1px 3px rgba(0,0,0,0.28), 0 0 0 0.5px rgba(0,0,0,0.05);
+    cursor:pointer;
+    transition:transform .15s cubic-bezier(.34,1.56,.64,1), box-shadow .15s ease;
+  }
+  #priceFilterSlider:active::-moz-range-thumb{
+    transform:scale(1.22);
+    box-shadow:0 2px 8px rgba(0,0,0,0.32), 0 0 0 0.5px rgba(0,0,0,0.06);
+  }
+
+  /* ---------- MARKERS ---------- */
+  .beer-pin{
+    width:34px; height:34px; border-radius:50% 50% 50% 0;
+    transform:rotate(-45deg);
+    display:flex; align-items:center; justify-content:center;
+    box-shadow:0 4px 10px rgba(0,0,0,0.28), inset 0 1px 1px rgba(255,255,255,0.5);
+    border:2px solid rgba(255,255,255,0.9);
+  }
+  .beer-pin svg{ transform:rotate(45deg); width:16px; height:16px; }
+  .pin-bar{ background:linear-gradient(150deg,#FF6259,var(--red)); }
+  .pin-discount{ background:linear-gradient(150deg,#FFC856,var(--amber-deep)); }
+
+  /* Venue pin: category icon on top, cheapest menu price below it, with a
+     small tail pointing at the exact coordinate. Used for any drink venue
+     (bar, cafe, etc.) — the icon and color come from that venue's category. */
+  .venue-pin{
+    display:flex; flex-direction:column; align-items:center;
+    filter:drop-shadow(0 3px 7px rgba(0,0,0,0.28));
+  }
+  .venue-pin-badge{
+    width:32px; height:32px; border-radius:50%;
+    display:flex; align-items:center; justify-content:center;
+    border:2px solid rgba(255,255,255,0.9);
+  }
+  .venue-pin-badge svg{ width:16px; height:16px; }
+  .venue-pin-price{
+    margin-top:3px;
+    background:#fff; color:var(--ink);
+    font-size:10.5px; font-weight:700;
+    padding:2.5px 7px;
+    border-radius:9px;
+    white-space:nowrap;
+  }
+  .venue-pin-tail{
+    width:0; height:0;
+    border-left:4px solid transparent;
+    border-right:4px solid transparent;
+    border-top:6px solid #fff;
+    margin-top:-1px;
+  }
+
+  .leaflet-popup-content-wrapper{
+    border-radius:16px;
+    background:rgba(255,255,255,0.72);
+    -webkit-backdrop-filter:blur(24px) saturate(160%);
+    backdrop-filter:blur(24px) saturate(160%);
+    box-shadow:
+      inset 0 0.5px 0.5px rgba(255,255,255,0.95),
+      inset 0 -0.5px 0.5px rgba(255,255,255,0.3),
+      0 10px 28px rgba(0,0,0,0.18);
+  }
+  .leaflet-popup-content{ margin:11px 15px; font-family:inherit; }
+  .leaflet-popup-tip{ background:rgba(255,255,255,0.72); }
+  .popup-title{ font-size:14.5px; font-weight:600; }
+  .popup-sub{ font-size:12px; color:var(--muted); margin-top:2px; }
+
+  /* ---------- TOAST ---------- */
+  #toast{
+    position:absolute; left:50%; bottom:calc(var(--safe-bottom) + 100px);
+    transform:translateX(-50%) translateY(14px);
+    z-index:60; opacity:0; pointer-events:none;
+    padding:12px 20px; border-radius:18px;
+    font-size:13.5px; font-weight:600; color:var(--ink);
+    white-space:nowrap;
+    transition:opacity .3s ease, transform .3s cubic-bezier(.34,1.4,.64,1);
+  }
+  #toast.show{ opacity:1; transform:translateX(-50%) translateY(0); }
+
+  /* ---------- PIN BOTTOM SHEET ---------- */
+  /* Three snap heights as a % of viewport height, swapped in JS per breakpoint. */
+  :root{
+    --sheet-peek:30vh;
+    --sheet-medium:56vh;
+    --sheet-full:calc(100% - var(--safe-top) - 10px);
+  }
+  #sheetScrim{
+    position:absolute; inset:0; z-index:70;
+    background:rgba(0,0,0,0.32);
+    opacity:0; pointer-events:none;
+    transition:opacity .3s ease;
+  }
+  #sheetScrim.show{ opacity:1; pointer-events:auto; }
+
+  #pinSheet{
+    position:absolute; left:0; right:0; bottom:0;
+    z-index:80;
+    width:100%;
+    height:var(--sheet-peek);
+    max-height:var(--sheet-full);
+    background:#f4f3ef;
+    border-radius:22px 22px 0 0;
+    box-shadow:0 -4px 20px rgba(0,0,0,0.14), 0 -1px 3px rgba(0,0,0,0.08);
+    display:flex; flex-direction:column;
+    transform:translateY(105%);
+    transition:transform .38s cubic-bezier(.32,.72,0,1), height .38s cubic-bezier(.32,.72,0,1);
+    touch-action:none;
+  }
+  #pinSheet.dragging{ transition:none; }
+  #pinSheet.open{ transform:translateY(0); }
+
+  #pinSheet .sheet-handle-zone{
+    flex-shrink:0;
+    display:flex; align-items:center; justify-content:center;
+    padding:10px 0 6px;
+    cursor:grab;
+  }
+  #pinSheet .sheet-handle{
+    width:36px; height:5px; border-radius:3px;
+    background:rgba(0,0,0,0.16);
+  }
+
+  #pinSheet .sheet-head{
+    flex-shrink:0;
+    padding:2px 22px 16px;
+    display:flex; align-items:flex-start; gap:14px;
+    border-bottom:0.5px solid rgba(0,0,0,0.08);
+  }
+  #pinSheet .sheet-icon{
+    width:46px; height:46px; border-radius:14px;
+    display:flex; align-items:center; justify-content:center;
+    flex-shrink:0; box-shadow:0 3px 10px rgba(0,0,0,0.18);
+  }
+  #pinSheet .sheet-icon svg{ width:22px; height:22px; }
+  #pinSheet .sheet-icon.kind-bar{ background:linear-gradient(150deg,#FF6259,var(--red)); }
+  #pinSheet .sheet-icon.kind-discount{ background:linear-gradient(150deg,#FFC856,var(--amber-deep)); }
+  #pinSheet .sheet-title{ font-size:18px; font-weight:700; letter-spacing:-0.2px; }
+  #pinSheet .sheet-sub{ font-size:13px; color:var(--muted); margin-top:3px; }
+
+  #pinSheet .sheet-body{
+    flex:1; min-height:0;
+    overflow-y:auto;
+    -webkit-overflow-scrolling:touch;
+    padding:18px 22px calc(var(--safe-bottom) + 24px);
+  }
+  #pinSheet .sheet-row{
+    display:flex; align-items:center; gap:12px;
+    padding:12px 0;
+    border-bottom:0.5px solid rgba(0,0,0,0.06);
+    font-size:14.5px;
+  }
+  #pinSheet .sheet-row:last-child{ border-bottom:none; }
+  #pinSheet .sheet-row svg{ width:18px; height:18px; stroke:var(--ink-soft); flex-shrink:0; }
+
+  #pinSheet .sheet-menu-label{
+    font-size:11.5px; font-weight:700; color:var(--muted);
+    text-transform:uppercase; letter-spacing:0.5px;
+    margin:16px 0 2px;
+  }
+  #pinSheet .sheet-drink-row{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:10px 0;
+    border-bottom:0.5px solid rgba(0,0,0,0.06);
+    font-size:14.5px;
+  }
+  #pinSheet .sheet-drink-row:last-of-type{ border-bottom:none; }
+  #pinSheet .sheet-drink-name{ color:var(--ink); }
+  #pinSheet .sheet-drink-price{ font-weight:700; color:var(--amber-deep); flex-shrink:0; margin-left:12px; }
+
+  /* The single cheapest item on the whole menu — the thing people actually
+     scan the sheet for, so it reads at a glance instead of blending into
+     the list. */
+  #pinSheet .sheet-drink-row.featured{
+    padding:14px 12px;
+    margin:4px 0 10px;
+    border-bottom:none;
+    border-radius:14px;
+    background:linear-gradient(150deg, rgba(255,176,32,0.16), rgba(255,176,32,0.05));
+    border:1px solid rgba(255,176,32,0.35);
+  }
+  #pinSheet .sheet-drink-row.featured .sheet-drink-name{
+    font-size:18px; font-weight:700; letter-spacing:-0.2px;
+  }
+  #pinSheet .sheet-drink-row.featured .sheet-drink-price{
+    font-size:22px; font-weight:800; color:var(--amber-deep);
+  }
+  #pinSheet .sheet-drink-row.featured .sheet-drink-tag{
+    display:block; font-size:10.5px; font-weight:700; color:var(--amber-deep);
+    text-transform:uppercase; letter-spacing:0.5px; margin-bottom:2px;
+  }
+
+  #pinSheet .sheet-cta{
+    margin-top:18px;
+    width:100%; border:none; border-radius:16px;
+    padding:14px; font-size:15px; font-weight:700; color:#fff;
+    background:linear-gradient(145deg, var(--amber), var(--amber-deep));
+    box-shadow:0 4px 14px rgba(232,148,10,0.32);
+    cursor:pointer;
+  }
+  #pinSheet .sheet-cta:active{ transform:scale(0.98); }
+
+  /* ---------- STATUS BAR SCRIM (so hamburger is readable over any tile) ---------- */
+  #topScrim{
+    position:absolute; top:0; left:0; right:0; height:calc(var(--safe-top) + 78px);
+    z-index:5; pointer-events:none;
+    background:linear-gradient(rgba(232,230,223,0.65), rgba(232,230,223,0));
+  }
+</style>
+</head>
+<body>
+<svg id="lg-defs" xmlns="http://www.w3.org/2000/svg">
+  <filter id="lg-lens" x="-20%" y="-20%" width="140%" height="140%">
+    <feTurbulence type="fractalNoise" baseFrequency="0.012 0.018" numOctaves="2" seed="7" result="noise"/>
+    <feGaussianBlur in="noise" stdDeviation="2" result="softNoise"/>
+    <feDisplacementMap in="SourceGraphic" in2="softNoise" scale="9" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+</svg>
+<div id="app">
+
+  <!-- Side panel: fixed bottom layer, always mounted, revealed as the page stack slides right -->
+  <nav id="sidePanel">
+    <div class="panel-header">
+      <div class="panel-avatar">🍺</div>
+      <div>
+        <div class="panel-title">BeerMap</div>
+        <div class="panel-sub">Trouve ta bière au meilleur prix</div>
+      </div>
+    </div>
+
+    <div class="panel-nav">
+      <div class="panel-section-label">Explorer</div>
+      <div class="panel-item active" data-page="Carte">
+        <div class="panel-icon"><svg viewBox="0 0 24 24"><path d="M9 3 3 5.5v15L9 18l6 3 6-2.5v-15L15 6 9 3Z"/><path d="M9 3v15M15 6v15"/></svg></div>
+        Carte
+        <span class="panel-trailing"><svg class="panel-chevron" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></span>
+      </div>
+      <div class="panel-item" data-page="Bars à proximité">
+        <div class="panel-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="10" r="7"/><path d="M12 21c0-4 3-6 3-9"/></svg></div>
+        Bars à proximité
+        <span class="panel-trailing"><svg class="panel-chevron" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></span>
+      </div>
+      <div class="panel-item" data-page="Bons plans">
+        <div class="panel-icon"><svg viewBox="0 0 24 24"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg></div>
+        Bons plans
+        <span class="panel-trailing">
+          <span class="panel-badge">3</span>
+          <svg class="panel-chevron" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg>
+        </span>
+      </div>
+
+      <div class="panel-section-label">Moi</div>
+      <div class="panel-item" data-page="Mes contributions">
+        <div class="panel-icon"><svg viewBox="0 0 24 24"><path d="M12 2 3 7v6c0 5 4 8.5 9 9 5-.5 9-4 9-9V7l-9-5Z"/></svg></div>
+        Mes contributions
+        <span class="panel-trailing"><svg class="panel-chevron" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></span>
+      </div>
+      <div class="panel-item" data-page="Favoris">
+        <div class="panel-icon"><svg viewBox="0 0 24 24"><path d="M12 21s-7.5-4.6-10-9.3C.4 8 2 4 6 4c2.3 0 3.9 1.3 6 3.5C14.1 5.3 15.7 4 18 4c4 0 5.6 4 4 7.7C19.5 16.4 12 21 12 21Z"/></svg></div>
+        Favoris
+        <span class="panel-trailing"><svg class="panel-chevron" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></span>
+      </div>
+      <div class="panel-item" data-page="Paramètres">
+        <div class="panel-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg></div>
+        Paramètres
+        <span class="panel-trailing"><svg class="panel-chevron" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></span>
+      </div>
+      <div class="panel-item" data-page="À propos">
+        <div class="panel-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-5M12 8h.01"/></svg></div>
+        À propos
+        <span class="panel-trailing"><svg class="panel-chevron" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></span>
+      </div>
+    </div>
+
+    <div class="panel-footer">BeerMap · v1.0 · Prototype</div>
+  </nav>
+
+  <!-- Page stack: the map page as one solid card that slides right to reveal the panel -->
+  <div id="pageStack">
+
+    <div id="map"></div>
+    <div id="topScrim"></div>
+    <div id="pageScrim"></div>
+
+    <!-- Pin bottom sheet: peek / medium / full -->
+    <div id="sheetScrim"></div>
+    <div id="pinSheet">
+      <div class="sheet-handle-zone"><div class="sheet-handle"></div></div>
+      <div class="sheet-head">
+        <div class="sheet-icon" id="sheetIcon"></div>
+        <div>
+          <div class="sheet-title" id="sheetTitle"></div>
+          <div class="sheet-sub" id="sheetSub"></div>
+        </div>
+      </div>
+      <div class="sheet-body" id="sheetBody"></div>
+    </div>
+
+    <!-- Hamburger -->
+    <button id="menuBtn" class="lg" aria-label="Ouvrir le menu">
+      <svg viewBox="0 0 20 20">
+        <line id="l1" x1="2.5" y1="5.5" x2="17.5" y2="5.5"></line>
+        <line id="l2" x1="2.5" y1="10" x2="17.5" y2="10"></line>
+        <line id="l3" x1="2.5" y1="14.5" x2="17.5" y2="14.5"></line>
+      </svg>
+    </button>
+
+    <!-- Search: round button top-right that morphs into a search bar with filters + sort -->
+    <div id="searchBar" class="lg">
+      <button id="searchMain" aria-label="Rechercher">
+        <svg viewBox="0 0 24 24" fill="none" stroke="var(--ink)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M20 20l-4.3-4.3"/></svg>
+      </button>
+      <button class="search-mini" id="optSort" aria-label="Trier">
+        <svg viewBox="0 0 24 24" fill="none" stroke="var(--ink-soft)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v14M6 17l-3-3M6 17l3-3M18 21V7M18 7l-3 3M18 7l3 3"/></svg>
+      </button>
+      <button class="search-mini" id="optFilters" aria-label="Filtres">
+        <svg viewBox="0 0 24 24" fill="none" stroke="var(--ink-soft)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16l-6.5 7.5V19l-3 1.5v-8L4 5Z"/></svg>
+      </button>
+      <input id="searchInput" type="text" placeholder="Rechercher un bar, une bière…" autocomplete="off" />
+    </div>
+
+  <!-- FAB: Pub Crawl (independent stack, sits above the add-bar/add-discount FAB) -->
+  <div id="fabWrapCrawl">
+    <div class="fab-option" id="optCrawlAI">
+      <span class="fab-label lg lg-clear">Laisser l'IA décider</span>
+      <button class="fab-mini lg lg-clear" aria-label="Laisser l'IA décider">
+        <svg viewBox="0 0 24 24" fill="none" stroke="var(--ink)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M3 12h3M18 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/><circle cx="12" cy="12" r="3.2"/></svg>
+      </button>
+    </div>
+    <div class="fab-option" id="optCrawlNew">
+      <span class="fab-label lg lg-clear">Créer une nouvelle</span>
+      <button class="fab-mini lg lg-clear" aria-label="Créer une nouvelle tournée">
+        <svg viewBox="0 0 24 24" fill="none" stroke="var(--ink)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg>
+      </button>
+    </div>
+    <button id="fabCrawlMain" class="lg lg-clear" aria-label="Tournée des bars">
+      <svg viewBox="0 0 24 24" fill="none" stroke="var(--ink)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="19" r="2.2"/><circle cx="18" cy="5" r="2.2"/><path d="M6 16.8V13a4 4 0 0 1 4-4h4a4 4 0 0 0 4-4"/></svg>
+    </button>
+  </div>
+
+  <!-- FAB -->
+  <div id="fabWrap">
+    <div class="fab-option" id="optDiscount">
+      <span class="fab-label lg lg-clear">Ajouter une réduction bière</span>
+      <button class="fab-mini lg lg-clear" aria-label="Ajouter une réduction bière">
+        <svg viewBox="0 0 24 24" fill="none" stroke="var(--ink)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg>
+      </button>
+    </div>
+    <div class="fab-option" id="optBar">
+      <span class="fab-label lg lg-clear">Ajouter un bar</span>
+      <button class="fab-mini lg lg-clear" aria-label="Ajouter un bar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="var(--ink)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="10" r="7"/><path d="M12 21c0-4 3-6 3-9"/></svg>
+      </button>
+    </div>
+    <button id="fabMain" class="lg lg-clear" aria-label="Ajouter">
+      <svg viewBox="0 0 24 24" fill="none" stroke="var(--ink)" stroke-width="2.4" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+    </button>
+  </div>
+
+  <div id="toast" class="lg"></div>
+
+  <!-- PRICE FILTER: caps visible bar pins to those with a cheapest drink
+       at or under the chosen price. Bounds are set from JS once the venue
+       data is in (0 to the highest "cheapest price" currently on screen). -->
+  <div id="priceFilter" class="lg lg-clear">
+    <div class="price-filter-row">
+      <span class="price-filter-label">Prix</span>
+      <span class="price-filter-value" id="priceFilterValue">—</span>
+    </div>
+    <input type="range" id="priceFilterSlider" min="0" max="0" step="0.5" value="0" />
+  </div>
+
+  </div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(function(){
+  // ---------- MAP ----------
+  var start = [48.8566, 2.3522]; // Paris, default center for the prototype
+  var map = L.map('map', {
+    zoomControl:false,
+    attributionControl:true,
+    tap:true
+  }).setView(start, 15);
+
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    subdomains: 'abcd',
+    maxZoom: 20
+  }).addTo(map);
+
+  function discountPinIcon(){
+    var svg = '<svg viewBox="0 0 24 24" fill="none" stroke="#7a4a02" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg>';
+    return L.divIcon({
+      className: '',
+      html: '<div class="beer-pin pin-discount">' + svg + '</div>',
+      iconSize:[34,34],
+      iconAnchor:[17,32],
+      popupAnchor:[0,-30]
+    });
+  }
+
+  // ---------- Venue categories ----------
+  // Each category maps to its own marker icon + color. Add a new entry here
+  // (e.g. "wine_bar", "brewery") and any venue tagged with that category
+  // automatically gets the right icon — no other code needs to change.
+  var categoryIcons = {
+    bar: {
+      gradient: 'linear-gradient(150deg,#FF6259,var(--red))',
+      svg: '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="10" r="7"/><path d="M12 21c0-4 3-6 3-9"/></svg>'
+    },
+    cafe: {
+      gradient: 'linear-gradient(150deg,#C99257,#8B5E34)',
+      svg: '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h13v5a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5V8Z"/><path d="M17 9h1.5a2.5 2.5 0 0 1 0 5H17"/><path d="M8 3.3c0 1-1 1-1 2M12 3.3c0 1-1 1-1 2"/></svg>'
+    }
+  };
+
+  function formatPrice(value){ return value.toFixed(2).replace('.', ',') + ' €'; }
+
+  function cheapestValue(drinks){
+    if (!drinks || !drinks.length) return null;
+    var min = null;
+    drinks.forEach(function(d){
+      if (min === null || d.priceValue < min) min = d.priceValue;
+    });
+    return min;
+  }
+
+  function cheapestPrice(drinks){
+    var min = cheapestValue(drinks);
+    return min === null ? null : formatPrice(min);
+  }
+
+  // Category icon on top, cheapest menu price below it, small tail pointing
+  // at the exact coordinate.
+  function venuePinIcon(category, priceLabel){
+    var cfg = categoryIcons[category] || categoryIcons.bar;
+    var priceHtml = priceLabel ? '<div class="venue-pin-price">' + priceLabel + '</div>' : '';
+    return L.divIcon({
+      className: '',
+      html:
+        '<div class="venue-pin">' +
+          '<div class="venue-pin-badge" style="background:' + cfg.gradient + '">' + cfg.svg + '</div>' +
+          priceHtml +
+          '<div class="venue-pin-tail"></div>' +
+        '</div>',
+      iconSize:[60,68],
+      iconAnchor:[30,66],
+      popupAnchor:[0,-60]
+    });
+  }
+
+  // ---------- Fake drink menus (used by mock + test venues) ----------
+  var drinkPool = [
+    { name:"Pinte blonde", category:"Bières" },
+    { name:"Pinte IPA", category:"Bières" },
+    { name:"Pinte brune", category:"Bières" },
+    { name:"Demi pression", category:"Bières" },
+    { name:"Mojito", category:"Cocktails" },
+    { name:"Gin Tonic", category:"Cocktails" },
+    { name:"Kir royal", category:"Cocktails" },
+    { name:"Spritz Aperol", category:"Cocktails" },
+    { name:"Planteur", category:"Cocktails" },
+    { name:"Tequila Sunrise", category:"Cocktails" },
+    { name:"Piña Colada", category:"Cocktails" },
+    { name:"Old Fashioned", category:"Cocktails" },
+    { name:"Negroni", category:"Cocktails" },
+    { name:"Margarita", category:"Cocktails" },
+    { name:"Punch coco", category:"Cocktails" },
+    { name:"Verre de rouge", category:"Vins" },
+    { name:"Verre de blanc", category:"Vins" },
+    { name:"Coupe de champagne", category:"Vins" },
+    { name:"Whisky Coca", category:"Spiritueux" },
+    { name:"Vodka Redbull", category:"Spiritueux" },
+    { name:"Rhum arrangé", category:"Spiritueux" },
+    { name:"Cidre brut", category:"Autres" }
+  ];
+
+  // Display order for menu categories in the pin sheet.
+  var CATEGORY_ORDER = ["Bières", "Cocktails", "Vins", "Spiritueux", "Autres"];
+
+  function randomPriceValue(){ return +(4 + Math.random() * 10).toFixed(2); } // 4€ to 14€
+
+  function fakeMenu(){
+    var count = 5 + Math.floor(Math.random() * 6); // 5 to 10 drinks
+    var pool = drinkPool.slice();
+    var menu = [];
+    for (var i = 0; i < count && pool.length; i++){
+      var idx = Math.floor(Math.random() * pool.length);
+      var value = randomPriceValue();
+      var item = pool[idx];
+      menu.push({ name: item.name, category: item.category, price: formatPrice(value), priceValue: value });
+      pool.splice(idx, 1);
+    }
+    return menu;
+  }
+
+  // Mock sample pins around the default center
+  var mockBars = [
+    { pos:[48.8580,2.3510], name:"Le Comptoir Voltaire", sub:"Bar à bières · ouvert", category:"bar", drinks: fakeMenu() },
+    { pos:[48.8545,2.3488], name:"Chez Marcel", sub:"Bar à bières · ouvert", category:"bar", drinks: fakeMenu() },
+    { pos:[48.8592,2.3560], name:"Brasserie du Marché", sub:"Bar à bières · ferme à 1h", category:"bar", drinks: fakeMenu() }
+  ];
+  var mockDiscounts = [
+    { pos:[48.8557,2.3546], name:"Happy Hour -50%", sub:"Au Vieux Chêne · jusqu'à 20h" },
+    { pos:[48.8600,2.3495], name:"Pinte à 4€", sub:"Le Zinc · tous les soirs" }
+  ];
+
+  // Every bar marker placed on the map, paired with its cheapest drink
+  // price — the price filter slider below is driven off this list.
+  var barMarkers = [];
+
+  function addBarMarker(b){
+    var price = cheapestValue(b.drinks);
+    var marker = L.marker(b.pos, { icon: venuePinIcon(b.category, price === null ? null : formatPrice(price)) })
+      .on('click', function(){ openPinSheet('bar', b); });
+    barMarkers.push({ marker: marker, price: price, onMap: false });
+  }
+
+  (function(){
+    var fakeNames = [
+      "Le Perchoir Rouge", "La Cave à Houblon", "Chez Fifi", "Le Repaire du Loup",
+      "L'Antre Doré", "Bar des Artistes", "Le Tonneau Ivre", "La Taverne du Coin",
+      "Le Zinc Bleu", "Bistrot Lafayette", "Le Fût Perdu", "La Guinguette Noire",
+      "L'Alambic Discret", "Le Refuge des Brasseurs", "Bar Central", "Le Vieux Pressoir",
+      "La Pinte Curieuse", "Le Nid à Bières", "Chez Gaspard", "Le Comptoir des Halles"
+    ];
+
+    var fakeBars = fakeNames.map(function(name, i){
+      // Small random jitter (~ within a few hundred metres) around the city center.
+      var lat = start[0] + (Math.random() - 0.5) * 0.024;
+      var lng = start[1] + (Math.random() - 0.5) * 0.036;
+      return {
+        pos: [lat, lng],
+        name: name,
+        sub: "Bar de test · données fictives",
+        category: "bar",
+        drinks: fakeMenu()
+      };
+    });
+
+    fakeBars.forEach(addBarMarker);
+  })();
+
+  mockBars.forEach(addBarMarker);
+  mockDiscounts.forEach(function(d){
+    L.marker(d.pos, { icon: discountPinIcon() }).addTo(map)
+      .on('click', function(){ openPinSheet('discount', d); });
+  });
+
+  // ---------- PRICE FILTER ----------
+  // Bounds: 0 up to the highest "cheapest price" among the bars currently
+  // shown on screen, rounded up to the next euro for a clean slider.
+  (function(){
+    var priceFilter = document.getElementById('priceFilter');
+    var slider = document.getElementById('priceFilterSlider');
+    var valueLabel = document.getElementById('priceFilterValue');
+
+    var known = barMarkers.filter(function(m){ return m.price !== null; });
+    if (!known.length){ priceFilter.style.display = 'none'; return; }
+
+    var maxPrice = Math.ceil(Math.max.apply(null, known.map(function(m){ return m.price; })));
+
+    // Fine step for a continuous, glass-smooth drag feel rather than
+    // noticeable half-euro notches.
+    slider.min = 0;
+    slider.max = maxPrice;
+    slider.step = 0.1;
+    slider.value = maxPrice;
+    valueLabel.textContent = formatPrice(maxPrice);
+
+    function paintTrack(){
+      var pct = maxPrice > 0 ? (parseFloat(slider.value) / maxPrice) * 100 : 100;
+      slider.style.background = 'linear-gradient(to right, var(--amber-deep) 0%, var(--amber-deep) ' + pct + '%, rgba(0,0,0,0.1) ' + pct + '%, rgba(0,0,0,0.1) 100%)';
+    }
+
+    // Re-checking every marker against the threshold is thrown onto a
+    // single animation frame at a time so a fast drag never queues up
+    // more add/removeLayer passes than the browser can actually paint.
+    var framePending = false;
+    function scheduleMarkerPass(threshold){
+      if (framePending) return;
+      framePending = true;
+      requestAnimationFrame(function(){
+        framePending = false;
+        barMarkers.forEach(function(m){
+          var shouldShow = m.price === null || m.price <= threshold;
+          if (shouldShow && !m.onMap){
+            m.marker.addTo(map);
+            m.onMap = true;
+          } else if (!shouldShow && m.onMap){
+            map.removeLayer(m.marker);
+            m.onMap = false;
+          }
+        });
+      });
+    }
+
+    function onInput(){
+      var threshold = parseFloat(slider.value);
+      valueLabel.textContent = formatPrice(threshold);
+      paintTrack();
+      scheduleMarkerPass(threshold);
+    }
+
+    slider.addEventListener('input', onInput);
+    onInput(); // show everything at the default (max) threshold
+  })();
+
+  // ---------- HAMBURGER + SIDE PANEL (push-reveal drawer) ----------
+  var menuBtn = document.getElementById('menuBtn');
+  var pageStack = document.getElementById('pageStack');
+  var pageScrim = document.getElementById('pageScrim');
+  var panelOpen = false;
+
+  function openPanel(){
+    panelOpen = true;
+    pageStack.classList.add('pushed');
+    pageStack.style.transform = '';
+    pageScrim.style.opacity = '';
+    closeFab();
+    closeFabCrawl();
+  }
+  function closePanel(){
+    panelOpen = false;
+    pageStack.classList.remove('pushed');
+    pageStack.style.transform = '';
+    pageScrim.style.opacity = '';
+  }
+  pageScrim.addEventListener('click', closePanel);
+
+  // Reveal distance in px — mirrors the CSS min(82%, 340px) used by
+  // #pageStack.pushed, computed live so it stays correct if the viewport
+  // (and therefore 82%) changes.
+  function panelTravelPx(){
+    return Math.min(pageStack.getBoundingClientRect().width * 0.82, 340);
+  }
+
+  // Drag-to-open/close: the hamburger tracks the finger 1:1 while held,
+  // then snaps open or closed on release — same model as the pin sheet's
+  // handle drag, just horizontal and bound to the menu button instead.
+  var menuDragStartX = null;
+  var menuDragBaseX = 0;   // px offset of pageStack at drag start (0 or travel)
+  var menuDragging = false;
+  var menuDragMoved = false;
+
+  function onMenuDragStart(e){
+    menuDragStartX = (e.touches ? e.touches[0].clientX : e.clientX);
+    menuDragBaseX = panelOpen ? panelTravelPx() : 0;
+    menuDragging = true;
+    menuDragMoved = false;
+    pageStack.classList.add('dragging');
+  }
+  function onMenuDragMove(e){
+    if (!menuDragging) return;
+    var x = (e.touches ? e.touches[0].clientX : e.clientX);
+    var delta = x - menuDragStartX;
+    if (Math.abs(delta) > 3) menuDragMoved = true;
+    var travel = panelTravelPx();
+    var newX = Math.max(0, Math.min(travel, menuDragBaseX + delta));
+    pageStack.style.transform = 'translateX(' + newX + 'px)';
+    pageScrim.style.opacity = String(newX / travel);
+  }
+  function onMenuDragEnd(){
+    if (!menuDragging) return;
+    menuDragging = false;
+    pageStack.classList.remove('dragging');
+
+    if (!menuDragMoved){
+      // No real movement — treat as a plain tap, same as before.
+      pageStack.style.transform = '';
+      pageScrim.style.opacity = '';
+      panelOpen ? closePanel() : openPanel();
+      return;
+    }
+
+    // Snap to whichever side the drag ended closer to.
+    var travel = panelTravelPx();
+    var currentX = pageStack.getBoundingClientRect().left; // pageStack is inset:0, so left == current translateX
+    pageScrim.style.opacity = '';
+    if (currentX > travel * 0.4){
+      openPanel();
+    } else {
+      closePanel();
+    }
+  }
+
+  menuBtn.addEventListener('pointerdown', onMenuDragStart);
+  window.addEventListener('pointermove', onMenuDragMove);
+  window.addEventListener('pointerup', onMenuDragEnd);
+  menuBtn.addEventListener('click', function(e){
+    // The pointerdown/up pair above already opens or closes the panel
+    // (as a tap or as a drag-release); suppress the browser's own
+    // synthesized click so the panel doesn't get toggled a second time.
+    e.preventDefault();
+  });
+
+  var navItems = document.querySelectorAll('.panel-item');
+  navItems.forEach(function(item){
+    item.addEventListener('click', function(){
+      navItems.forEach(function(i){ i.classList.remove('active'); });
+      item.classList.add('active');
+      var page = item.getAttribute('data-page');
+      showToast(page);
+      closePanel();
+    });
+  });
+
+  // ---------- FAB ----------
+  var fabWrap = document.getElementById('fabWrap');
+  var fabMain = document.getElementById('fabMain');
+  var fabOpen = false;
+
+  function openFab(){ fabOpen = true; fabWrap.classList.add('open'); closeFabCrawl(); closeSearch(); fabWrapCrawl.classList.add('hide'); }
+  function closeFab(){ fabOpen = false; fabWrap.classList.remove('open'); fabWrapCrawl.classList.remove('hide'); }
+
+  fabMain.addEventListener('click', function(e){
+    e.stopPropagation();
+    fabOpen ? closeFab() : openFab();
+  });
+
+  document.getElementById('optBar').addEventListener('click', function(e){
+    e.stopPropagation();
+    showToast('Ajouter un bar');
+    closeFab();
+  });
+  document.getElementById('optDiscount').addEventListener('click', function(e){
+    e.stopPropagation();
+    showToast('Ajouter une réduction sur la bière');
+    closeFab();
+  });
+
+  // ---------- FAB: Pub Crawl (independent stack, mutually exclusive with the FAB above) ----------
+  var fabWrapCrawl = document.getElementById('fabWrapCrawl');
+  var fabCrawlMain = document.getElementById('fabCrawlMain');
+  var fabCrawlOpen = false;
+
+  function openFabCrawl(){ fabCrawlOpen = true; fabWrapCrawl.classList.add('open'); closeFab(); closeSearch(); }
+  function closeFabCrawl(){ fabCrawlOpen = false; fabWrapCrawl.classList.remove('open'); }
+
+  fabCrawlMain.addEventListener('click', function(e){
+    e.stopPropagation();
+    fabCrawlOpen ? closeFabCrawl() : openFabCrawl();
+  });
+
+  document.getElementById('optCrawlNew').addEventListener('click', function(e){
+    e.stopPropagation();
+    showToast('Créer une nouvelle tournée');
+    closeFabCrawl();
+  });
+  document.getElementById('optCrawlAI').addEventListener('click', function(e){
+    e.stopPropagation();
+    showToast("L'IA choisit la tournée");
+    closeFabCrawl();
+  });
+
+  // ---------- SEARCH (top-right, opens leftward into a search bar) ----------
+  var searchWrap = document.getElementById('searchBar');
+  var searchMain = document.getElementById('searchMain');
+  var searchInput = document.getElementById('searchInput');
+  var searchOpen = false;
+
+  function openSearch(){
+    searchOpen = true;
+    searchWrap.classList.add('open');
+    closeFab();
+    closeFabCrawl();
+    // Wait for the bar's expand transition to be underway before focusing,
+    // so mobile keyboards don't jump in and fight the animation.
+    setTimeout(function(){ if (searchOpen) searchInput.focus(); }, 150);
+  }
+  function closeSearch(){
+    searchOpen = false;
+    searchWrap.classList.remove('open');
+    searchInput.blur();
+  }
+
+  searchMain.addEventListener('click', function(e){
+    e.stopPropagation();
+    searchOpen ? closeSearch() : openSearch();
+  });
+
+  searchInput.addEventListener('click', function(e){ e.stopPropagation(); });
+  searchInput.addEventListener('keydown', function(e){
+    if (e.key === 'Enter'){
+      showToast(searchInput.value ? ('Recherche : ' + searchInput.value) : 'Recherche');
+      closeSearch();
+    }
+  });
+
+  document.getElementById('optFilters').addEventListener('click', function(e){
+    e.stopPropagation();
+    showToast('Filtres');
+    closeSearch();
+  });
+  document.getElementById('optSort').addEventListener('click', function(e){
+    e.stopPropagation();
+    showToast('Trier');
+    closeSearch();
+  });
+
+  document.getElementById('map').addEventListener('click', function(){
+    if (fabOpen) closeFab();
+    if (fabCrawlOpen) closeFabCrawl();
+    if (searchOpen) closeSearch();
+  });
+
+  // ---------- PIN BOTTOM SHEET ----------
+  var pinSheet = document.getElementById('pinSheet');
+  var sheetScrim = document.getElementById('sheetScrim');
+  var sheetIcon = document.getElementById('sheetIcon');
+  var sheetTitle = document.getElementById('sheetTitle');
+  var sheetSub = document.getElementById('sheetSub');
+  var sheetBody = document.getElementById('sheetBody');
+  var sheetHandleZone = document.querySelector('.sheet-handle-zone');
+  var sheetHead = document.querySelector('.sheet-head');
+
+  var SNAP = { peek:'var(--sheet-peek)', medium:'var(--sheet-medium)', full:'var(--sheet-full)' };
+  var sheetState = null; // 'peek' | 'medium' | 'full' | null(closed)
+
+  var barExtras = [
+    { icon:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>', label:'Ouvert · ferme à 1h' },
+    { icon:'<path d="M12 21s-7-4.5-9-9C1 7 3 3 7 3c2 0 3.5 1.3 5 3.2C13.5 4.3 15 3 17 3c4 0 6 4 4 9-2 4.5-9 9-9 9Z"/>', label:'4.6 · 212 avis' },
+    { icon:'<path d="M3 12h18M3 6h18M3 18h18"/>', label:'Bière blonde, IPA, brune au fût' }
+  ];
+  var discountExtras = [
+    { icon:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>', label:'Valable jusqu\'à 20h' },
+    { icon:'<path d="M20 12V8a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v4M4 12v6a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-6M4 12h16"/>', label:'Sur présentation de l\'appli' },
+    { icon:'<path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/>', label:'Réduction ajoutée par la communauté' }
+  ];
+
+  function renderExtraRow(e){
+    return '<div class="sheet-row"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + e.icon + '</svg><span>' + e.label + '</span></div>';
+  }
+
+  function openPinSheet(kind, data){
+    var isBar = kind === 'bar';
+    sheetIcon.className = 'sheet-icon ' + (isBar ? 'kind-bar' : 'kind-discount');
+    sheetIcon.innerHTML = isBar
+      ? '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="10" r="7"/><path d="M12 21c0-4 3-6 3-9"/></svg>'
+      : '<svg viewBox="0 0 24 24" fill="none" stroke="#7a4a02" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg>';
+    sheetTitle.textContent = data.name;
+    sheetSub.textContent = data.sub;
+
+    var extras = isBar ? barExtras : discountExtras;
+    var extrasHtml = extras.map(renderExtraRow).join('');
+
+    var menuHtml = '';
+    if (isBar && data.drinks && data.drinks.length){
+      var cheapest = data.drinks[0];
+      data.drinks.forEach(function(d){ if (d.priceValue < cheapest.priceValue) cheapest = d; });
+
+      var byCategory = {};
+      data.drinks.forEach(function(d){
+        var cat = d.category || 'Autres';
+        (byCategory[cat] = byCategory[cat] || []).push(d);
+      });
+      var orderedCats = CATEGORY_ORDER.filter(function(c){ return byCategory[c]; });
+      // Catch any category not in the known order, just in case.
+      Object.keys(byCategory).forEach(function(c){
+        if (orderedCats.indexOf(c) === -1) orderedCats.push(c);
+      });
+      menuHtml = orderedCats.map(function(cat){
+        var items = byCategory[cat].slice().sort(function(a, b){ return a.priceValue - b.priceValue; });
+        return '<div class="sheet-menu-label">' + cat + '</div>' + items.map(function(d){
+          var isCheapest = d === cheapest;
+          var rowClass = 'sheet-drink-row' + (isCheapest ? ' featured' : '');
+          var tagHtml = isCheapest ? '<span class="sheet-drink-tag">Le moins cher</span>' : '';
+          return '<div class="' + rowClass + '"><span class="sheet-drink-name">' + tagHtml + d.name + '</span><span class="sheet-drink-price">' + d.price + '</span></div>';
+        }).join('');
+      }).join('');
+    }
+
+    sheetBody.innerHTML = menuHtml + extrasHtml + '<button class="sheet-cta">' + (isBar ? 'Voir le bar' : 'Profiter de la réduction') + '</button>';
+    sheetBody.scrollTop = 0;
+
+    closeFab();
+    closeFabCrawl();
+    closeSearch();
+    setSheetState('medium');
+  }
+
+  function setSheetState(state){
+    sheetState = state;
+    pinSheet.style.height = SNAP[state];
+    pinSheet.classList.add('open');
+    sheetScrim.classList.add('show');
+  }
+
+  function closePinSheet(){
+    sheetState = null;
+    pinSheet.classList.remove('open');
+    sheetScrim.classList.remove('show');
+  }
+
+  sheetScrim.addEventListener('click', closePinSheet);
+
+  // Swiping/scrolling up on the sheet body while at 'medium' promotes to
+  // 'full', and swiping/scrolling down while already at the top of the
+  // content demotes it a step (full -> medium -> peek -> closed) — this
+  // must work even when the content itself is too short to natively
+  // overflow, so it's driven off the touch/pointer gesture rather than
+  // relying solely on a native 'scroll' event on the content.
+  var bodyGestureStartY = null;
+  var bodyGestureMoved = false;
+
+  var STATE_DOWN = { full:'medium', medium:'peek' };
+
+  function demoteSheet(){
+    if (sheetState === 'peek'){ closePinSheet(); return; }
+    var next = STATE_DOWN[sheetState];
+    if (next) setSheetState(next);
+  }
+
+  function bodyGestureStart(y){
+    bodyGestureStartY = y;
+    bodyGestureMoved = false;
+  }
+  function bodyGestureMove(y){
+    if (bodyGestureStartY === null || bodyGestureMoved) return;
+    var deltaUp = bodyGestureStartY - y; // positive = moving finger up, negative = moving down
+    // Only trigger while still at the top of the content, so a normal scroll
+    // deeper into an overflowing list is left untouched.
+    if (sheetBody.scrollTop > 0) return;
+    if (sheetState === 'medium' && deltaUp > 12){
+      bodyGestureMoved = true;
+      setSheetState('full');
+    } else if (deltaUp < -12){
+      bodyGestureMoved = true;
+      demoteSheet();
+    }
+  }
+  function bodyGestureEnd(){
+    bodyGestureStartY = null;
+    bodyGestureMoved = false;
+  }
+
+  sheetBody.addEventListener('touchstart', function(e){ bodyGestureStart(e.touches[0].clientY); }, { passive:true });
+  sheetBody.addEventListener('touchmove', function(e){ bodyGestureMove(e.touches[0].clientY); }, { passive:true });
+  sheetBody.addEventListener('touchend', bodyGestureEnd);
+
+  // Mouse/trackpad fallback (also what our automated tests drive).
+  sheetBody.addEventListener('pointerdown', function(e){
+    if (e.pointerType === 'touch') return; // touch already handled above
+    bodyGestureStart(e.clientY);
+  });
+  sheetBody.addEventListener('pointermove', function(e){
+    if (e.pointerType === 'touch') return;
+    bodyGestureMove(e.clientY);
+  });
+  window.addEventListener('pointerup', bodyGestureEnd);
+
+  // Wheel/trackpad scroll fallback: an upward wheel gesture at the top of
+  // the content promotes (at medium), a downward one demotes — same rule,
+  // only while there's nothing left above to scroll into.
+  var wheelSettleTimer = null;
+  sheetBody.addEventListener('wheel', function(e){
+    if (sheetBody.scrollTop > 0) return;
+    if (wheelSettleTimer) return; // debounce: one step per gesture burst
+    if (sheetState === 'medium' && e.deltaY < -4){
+      setSheetState('full');
+    } else if (e.deltaY > 4){
+      demoteSheet();
+    } else {
+      return;
+    }
+    wheelSettleTimer = setTimeout(function(){ wheelSettleTimer = null; }, 350);
+  }, { passive:true });
+
+  // ---------- Drag-to-resize (handle + header) ----------
+  var dragStartY = null, dragStartHeightPx = 0, dragging = false;
+
+  function pxFor(state){
+    var probe = document.createElement('div');
+    probe.style.position = 'absolute';
+    probe.style.height = SNAP[state];
+    probe.style.visibility = 'hidden';
+    pinSheet.parentElement.appendChild(probe);
+    var px = probe.getBoundingClientRect().height;
+    probe.remove();
+    return px;
+  }
+
+  function onDragStart(e){
+    if (sheetState === null) return;
+    dragging = true;
+    dragStartY = (e.touches ? e.touches[0].clientY : e.clientY);
+    dragStartHeightPx = pinSheet.getBoundingClientRect().height;
+    pinSheet.classList.add('dragging');
+  }
+  function onDragMove(e){
+    if (!dragging) return;
+    var y = (e.touches ? e.touches[0].clientY : e.clientY);
+    var delta = dragStartY - y; // positive = dragging up = taller
+    var newHeight = Math.max(60, dragStartHeightPx + delta);
+    pinSheet.style.height = newHeight + 'px';
+  }
+  function onDragEnd(){
+    if (!dragging) return;
+    dragging = false;
+    pinSheet.classList.remove('dragging');
+    var currentPx = pinSheet.getBoundingClientRect().height;
+    var peekPx = pxFor('peek'), mediumPx = pxFor('medium'), fullPx = pxFor('full');
+
+    // Snap to nearest of the three, with a downward drag past peek closing the sheet.
+    if (currentPx < peekPx * 0.55){
+      closePinSheet();
+      return;
+    }
+    var dPeek = Math.abs(currentPx - peekPx);
+    var dMedium = Math.abs(currentPx - mediumPx);
+    var dFull = Math.abs(currentPx - fullPx);
+    var nearest = 'peek';
+    var best = dPeek;
+    if (dMedium < best){ nearest = 'medium'; best = dMedium; }
+    if (dFull < best){ nearest = 'full'; best = dFull; }
+    setSheetState(nearest);
+  }
+
+  [sheetHandleZone, sheetHead].forEach(function(zone){
+    zone.addEventListener('pointerdown', onDragStart);
+  });
+  window.addEventListener('pointermove', onDragMove);
+  window.addEventListener('pointerup', onDragEnd);
+
+  // ---------- TOAST ----------
+  var toast = document.getElementById('toast');
+  var toastTimer = null;
+  function showToast(msg){
+    toast.textContent = msg;
+    toast.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function(){ toast.classList.remove('show'); }, 1900);
+  }
+
+  // ---------- LIQUID GLASS: reactive specular highlight ----------
+  // Real Liquid Glass repositions its highlight with device tilt/light, it
+  // doesn't loop on a timer. Drive it from the gyroscope when granted, and
+  // fall back to finger position while a glass surface is actively touched.
+  var glassEls = Array.prototype.slice.call(document.querySelectorAll('.lg'));
+  function setSpec(el, xPct, yPct){
+    el.style.setProperty('--specx', xPct + '%');
+    el.style.setProperty('--specy', yPct + '%');
+  }
+  glassEls.forEach(function(el){ setSpec(el, 30, 0); }); // default: light from upper-left
+
+  function applyTilt(beta, gamma){
+    // beta: front-back tilt (-180..180), gamma: left-right tilt (-90..90)
+    var x = Math.max(0, Math.min(100, 50 + gamma * 1.6));
+    var y = Math.max(0, Math.min(100, 50 + (beta - 40) * 1.1));
+    glassEls.forEach(function(el){ setSpec(el, x, y); });
+  }
+
+  function startGyro(){
+    window.addEventListener('deviceorientation', function(e){
+      if (e.beta === null || e.gamma === null) return;
+      applyTilt(e.beta, e.gamma);
+    });
+  }
+
+  if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function'){
+    // iOS 13+ requires a user gesture to request motion permission
+    var grantMotion = function(){
+      DeviceOrientationEvent.requestPermission().then(function(state){
+        if (state === 'granted') startGyro();
+      }).catch(function(){});
+      document.removeEventListener('touchend', grantMotion);
+    };
+    document.addEventListener('touchend', grantMotion, { once:true });
+  } else if (window.DeviceOrientationEvent){
+    startGyro();
+  }
+
+  // Pointer fallback: while a finger is on a glass surface, the highlight
+  // follows the touch point on that element specifically.
+  glassEls.forEach(function(el){
+    el.addEventListener('pointermove', function(e){
+      var r = el.getBoundingClientRect();
+      var x = ((e.clientX - r.left) / r.width) * 100;
+      var y = ((e.clientY - r.top) / r.height) * 100;
+      setSpec(el, x, y);
+    });
+  });
+
+})();
+</script>
+</body>
+</html>
